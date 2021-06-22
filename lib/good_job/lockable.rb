@@ -22,6 +22,8 @@ module GoodJob
     RecordAlreadyAdvisoryLockedError = Class.new(StandardError)
 
     included do
+      cattr_accessor(:lockable_column, instance_accessor: false) { primary_key }
+
       # Attempt to acquire an advisory lock on the selected records and
       # return only those records for which a lock could be acquired.
       # @!method advisory_lock
@@ -41,9 +43,14 @@ module GoodJob
 
         composed_cte = Arel::Nodes::As.new(cte_table, Arel::Nodes::SqlLiteral.new([cte_type, "(", cte_query.to_sql, ")"].join(' ')))
 
+        # In addition to an advisory lock, there is also a FOR UPDATE SKIP LOCKED
+        # because this causes the query to skip jobs that were completed (and deleted)
+        # by another session in the time since the table snapshot was taken.
+        # In rare cases under high concurrency levels, leaving this out can result in double executions.
         query = cte_table.project(cte_table[:id])
                          .with(composed_cte)
-                         .where(Arel.sql(sanitize_sql_for_conditions(["pg_try_advisory_lock(('x' || substr(md5(:table_name || #{connection.quote_table_name(cte_table.name)}.#{quoted_primary_key}::text), 1, 16))::bit(64)::bigint)", { table_name: table_name }])))
+                         .where(Arel.sql(sanitize_sql_for_conditions(["pg_try_advisory_lock(('x' || substr(md5(:table_name || #{connection.quote_table_name(cte_table.name)}.#{connection.quote_column_name(lockable_column)}::text), 1, 16))::bit(64)::bigint)", { table_name: table_name }])))
+                         .lock(Arel.sql("FOR UPDATE SKIP LOCKED"))
 
         limit = original_query.arel.ast.limit
         query.limit = limit.value if limit.present?
@@ -66,8 +73,8 @@ module GoodJob
         join_sql = <<~SQL.squish
           LEFT JOIN pg_locks ON pg_locks.locktype = 'advisory'
             AND pg_locks.objsubid = 1
-            AND pg_locks.classid = ('x' || substr(md5(:table_name || #{quoted_table_name}.#{quoted_primary_key}::text), 1, 16))::bit(32)::int
-            AND pg_locks.objid = (('x' || substr(md5(:table_name || #{quoted_table_name}.#{quoted_primary_key}::text), 1, 16))::bit(64) << 32)::bit(32)::int
+            AND pg_locks.classid = ('x' || substr(md5(:table_name || #{quoted_table_name}.#{connection.quote_column_name(lockable_column)}::text), 1, 16))::bit(32)::int
+            AND pg_locks.objid = (('x' || substr(md5(:table_name || #{quoted_table_name}.#{connection.quote_column_name(lockable_column)}::text), 1, 16))::bit(64) << 32)::bit(32)::int
         SQL
 
         joins(sanitize_sql_for_conditions([join_sql, { table_name: table_name }]))
@@ -152,12 +159,12 @@ module GoodJob
     # you are done with {#advisory_unlock} (or {#advisory_unlock!} to release
     # all remaining locks).
     # @return [Boolean] whether the lock was acquired.
-    def advisory_lock
+    def advisory_lock(key = lockable_key)
       query = <<~SQL.squish
         SELECT 1 AS one
-        WHERE pg_try_advisory_lock(('x'||substr(md5($1 || $2::text), 1, 16))::bit(64)::bigint)
+        WHERE pg_try_advisory_lock(('x'||substr(md5($1::text), 1, 16))::bit(64)::bigint)
       SQL
-      binds = [[nil, self.class.table_name], [nil, send(self.class.primary_key)]]
+      binds = [[nil, key]]
       self.class.connection.exec_query(pg_or_jdbc_query(query), 'GoodJob::Lockable Advisory Lock', binds).any?
     end
 
@@ -165,12 +172,12 @@ module GoodJob
     # session. Note that advisory locks stack, so you must call
     # {#advisory_unlock} and {#advisory_lock} the same number of times.
     # @return [Boolean] whether the lock was released.
-    def advisory_unlock
+    def advisory_unlock(key = lockable_key)
       query = <<~SQL.squish
         SELECT 1 AS one
-        WHERE pg_advisory_unlock(('x'||substr(md5($1 || $2::text), 1, 16))::bit(64)::bigint)
+        WHERE pg_advisory_unlock(('x'||substr(md5($1::text), 1, 16))::bit(64)::bigint)
       SQL
-      binds = [[nil, self.class.table_name], [nil, send(self.class.primary_key)]]
+      binds = [[nil, key]]
       self.class.connection.exec_query(pg_or_jdbc_query(query), 'GoodJob::Lockable Advisory Unlock', binds).any?
     end
 
@@ -179,8 +186,8 @@ module GoodJob
     # database session.
     # @raise [RecordAlreadyAdvisoryLockedError]
     # @return [Boolean] +true+
-    def advisory_lock!
-      result = advisory_lock
+    def advisory_lock!(key = lockable_key)
+      result = advisory_lock(key)
       result || raise(RecordAlreadyAdvisoryLockedError)
     end
 
@@ -196,10 +203,10 @@ module GoodJob
     #   record.with_advisory_lock do
     #     do_something_with record
     #   end
-    def with_advisory_lock
+    def with_advisory_lock(key = lockable_key)
       raise ArgumentError, "Must provide a block" unless block_given?
 
-      advisory_lock!
+      advisory_lock!(key)
       yield
     ensure
       advisory_unlock unless $ERROR_INFO.is_a? RecordAlreadyAdvisoryLockedError
@@ -207,40 +214,44 @@ module GoodJob
 
     # Tests whether this record has an advisory lock on it.
     # @return [Boolean]
-    def advisory_locked?
+    def advisory_locked?(key = lockable_key)
       query = <<~SQL.squish
         SELECT 1 AS one
         FROM pg_locks
         WHERE pg_locks.locktype = 'advisory'
           AND pg_locks.objsubid = 1
-          AND pg_locks.classid = ('x' || substr(md5($1 || $2::text), 1, 16))::bit(32)::int
-          AND pg_locks.objid = (('x' || substr(md5($3 || $4::text), 1, 16))::bit(64) << 32)::bit(32)::int
+          AND pg_locks.classid = ('x' || substr(md5($1::text), 1, 16))::bit(32)::int
+          AND pg_locks.objid = (('x' || substr(md5($2::text), 1, 16))::bit(64) << 32)::bit(32)::int
       SQL
-      binds = [[nil, self.class.table_name], [nil, send(self.class.primary_key)], [nil, self.class.table_name], [nil, send(self.class.primary_key)]]
+      binds = [[nil, key], [nil, key]]
       self.class.connection.exec_query(pg_or_jdbc_query(query), 'GoodJob::Lockable Advisory Locked?', binds).any?
     end
 
     # Tests whether this record is locked by the current database session.
     # @return [Boolean]
-    def owns_advisory_lock?
+    def owns_advisory_lock?(key = lockable_key)
       query = <<~SQL.squish
         SELECT 1 AS one
         FROM pg_locks
         WHERE pg_locks.locktype = 'advisory'
           AND pg_locks.objsubid = 1
-          AND pg_locks.classid = ('x' || substr(md5($1 || $2::text), 1, 16))::bit(32)::int
-          AND pg_locks.objid = (('x' || substr(md5($3 || $4::text), 1, 16))::bit(64) << 32)::bit(32)::int
+          AND pg_locks.classid = ('x' || substr(md5($1::text), 1, 16))::bit(32)::int
+          AND pg_locks.objid = (('x' || substr(md5($2::text), 1, 16))::bit(64) << 32)::bit(32)::int
           AND pg_locks.pid = pg_backend_pid()
       SQL
-      binds = [[nil, self.class.table_name], [nil, send(self.class.primary_key)], [nil, self.class.table_name], [nil, send(self.class.primary_key)]]
+      binds = [[nil, key], [nil, key]]
       self.class.connection.exec_query(pg_or_jdbc_query(query), 'GoodJob::Lockable Owns Advisory Lock?', binds).any?
     end
 
     # Releases all advisory locks on the record that are held by the current
     # database session.
     # @return [void]
-    def advisory_unlock!
-      advisory_unlock while advisory_locked?
+    def advisory_unlock!(key = lockable_key)
+      advisory_unlock(key) while advisory_locked?
+    end
+
+    def lockable_key
+      [self.class.table_name, self[self.class.lockable_column]].join
     end
 
     private
