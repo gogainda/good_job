@@ -6,6 +6,8 @@ module GoodJob
   class Job < Object.const_get(GoodJob.active_record_parent_class)
     include Lockable
 
+    self.lockable_column = "active_job_id"
+
     # Raised if something attempts to execute a previously completed Job again.
     PreviouslyPerformedError = Class.new(StandardError)
 
@@ -63,12 +65,7 @@ module GoodJob
     # @!scope class
     # @return [ActiveRecord::Relation]
     scope :unfinished, (lambda do
-      if column_names.include?('finished_at')
-        where(finished_at: nil)
-      else
-        ActiveSupport::Deprecation.warn('GoodJob expects a good_jobs.finished_at column to exist. Please see the GoodJob README.md for migration instructions.')
-        nil
-      end
+      where(finished_at: nil) if GoodJob.enhancements.finished_at_column?
     end)
 
     # Get Jobs that are not scheduled for a later time than now (i.e. jobs that
@@ -156,9 +153,26 @@ module GoodJob
     #   raised, if any (if the job raised, then the second array entry will be
     #   +nil+). If there were no jobs to execute, returns +nil+.
     def self.perform_with_advisory_lock
-      unfinished.priority_ordered.only_scheduled.limit(1).with_advisory_lock do |good_jobs|
+      advisory_lock_column = if GoodJob.enhancements.partially_lock_active_job_id?
+                               :active_job_id
+                             else
+                               :id
+                             end
+
+      unfinished.priority_ordered.only_scheduled.limit(1).with_advisory_lock(advisory_lock_column) do |good_jobs|
         good_job = good_jobs.first
-        good_job&.perform
+
+        if GoodJob.enhancements.fully_lock_active_job_id?
+          good_job&.perform
+        else
+          begin
+            good_job&.with_advisory_lock("good_jobs#{good_job.id}") do
+              good_job.perform
+            end
+          rescue GoodJob::RecordAlreadyAdvisoryLockedError
+            nil
+          end
+        end
       end
     end
 

@@ -30,11 +30,11 @@ module GoodJob
       # @!scope class
       # @return [ActiveRecord::Relation]
       #   A relation selecting only the records that were locked.
-      scope :advisory_lock, (lambda do
+      scope :advisory_lock, (lambda do |column = lockable_column |
         original_query = self
 
         cte_table = Arel::Table.new(:rows)
-        cte_query = original_query.select(primary_key).except(:limit)
+        cte_query = original_query.select(primary_key, column).except(:limit)
         cte_type = if supports_cte_materialization_specifiers?
                      'MATERIALIZED'
                    else
@@ -49,7 +49,7 @@ module GoodJob
         # In rare cases under high concurrency levels, leaving this out can result in double executions.
         query = cte_table.project(cte_table[:id])
                          .with(composed_cte)
-                         .where(Arel.sql(sanitize_sql_for_conditions(["pg_try_advisory_lock(('x' || substr(md5(:table_name || #{connection.quote_table_name(cte_table.name)}.#{connection.quote_column_name(lockable_column)}::text), 1, 16))::bit(64)::bigint)", { table_name: table_name }])))
+                         .where(Arel.sql(sanitize_sql_for_conditions(["pg_try_advisory_lock(('x' || substr(md5(:table_name || #{connection.quote_table_name(cte_table.name)}.#{connection.quote_column_name(column)}::text), 1, 16))::bit(64)::bigint)", { table_name: table_name }])))
                          .lock(Arel.sql("FOR UPDATE SKIP LOCKED"))
 
         limit = original_query.arel.ast.limit
@@ -136,10 +136,10 @@ module GoodJob
       #   MyLockableRecord.order(created_at: :asc).limit(2).with_advisory_lock do |record|
       #     do_something_with record
       #   end
-      def with_advisory_lock
+      def with_advisory_lock(column = lockable_column)
         raise ArgumentError, "Must provide a block" unless block_given?
 
-        records = advisory_lock.to_a
+        records = advisory_lock(column).to_a
         begin
           yield(records)
         ensure

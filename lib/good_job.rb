@@ -54,6 +54,8 @@ module GoodJob
   #   @return [Boolean, nil]
   mattr_accessor :retry_on_unhandled_error, default: true
 
+  mattr_reader :enhancements, default: GoodJob::Enhancements.new
+
   # @deprecated Use {GoodJob#retry_on_unhandled_error} instead.
   # @return [Boolean, nil]
   def self.reperform_jobs_on_standard_error

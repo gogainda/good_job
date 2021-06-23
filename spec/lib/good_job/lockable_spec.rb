@@ -2,7 +2,7 @@ require 'rails_helper'
 
 RSpec.describe GoodJob::Lockable do
   let(:model_class) { GoodJob::Job }
-  let(:job) { model_class.create! }
+  let(:job) { model_class.create(queue_name: "default") }
 
   describe '.advisory_lock' do
     around do |example|
@@ -41,6 +41,29 @@ RSpec.describe GoodJob::Lockable do
       SQL
     end
 
+    it 'can be customized with `lockable_column`' do
+      allow(model_class).to receive(:lockable_column).and_return("queue_name")
+      query = model_class.order(priority: :desc).limit(2).advisory_lock
+
+      expect(normalize_sql(query.to_sql)).to eq normalize_sql(<<~SQL.squish)
+        SELECT "good_jobs".*
+        FROM "good_jobs"
+        WHERE "good_jobs"."id" IN (
+          WITH "rows" AS #{'MATERIALIZED' if model_class.supports_cte_materialization_specifiers?} (
+            SELECT "good_jobs"."id", "good_jobs"."queue_name"
+            FROM "good_jobs"
+            ORDER BY "good_jobs"."priority" DESC
+          )
+          SELECT "rows"."id"
+          FROM "rows"
+          WHERE pg_try_advisory_lock(('x' || substr(md5('good_jobs' || "rows"."queue_name"::text), 1, 16))::bit(64)::bigint)
+          LIMIT 2
+          FOR UPDATE SKIP LOCKED
+        )
+        ORDER BY "good_jobs"."priority" DESC
+      SQL
+    end
+
     it 'returns first row of the query with a lock' do
       expect(job).not_to be_advisory_locked
       result_job = model_class.advisory_lock.first
@@ -48,6 +71,16 @@ RSpec.describe GoodJob::Lockable do
       expect(job).to be_advisory_locked
 
       job.advisory_unlock
+    end
+
+    it 'can lock an alternative column' do
+      expect(job).not_to be_advisory_locked
+      result_job = model_class.advisory_lock(:queue_name).first
+      expect(result_job).to eq job
+      expect(job).to be_advisory_locked("good_jobsdefault")
+      expect(job).not_to be_advisory_locked # on default key
+
+      job.advisory_unlock("good_jobsdefault")
     end
   end
 
@@ -81,6 +114,14 @@ RSpec.describe GoodJob::Lockable do
       expect(other_thread_owns_advisory_lock).to be false
 
       job.advisory_unlock
+    end
+
+    it 'can lock alternative values' do
+      job.advisory_lock!("alternative")
+      expect(job.advisory_locked?("alternative")).to be true
+      expect(job.advisory_locked?).to be false
+
+      job.advisory_unlock("alternative")
     end
   end
 

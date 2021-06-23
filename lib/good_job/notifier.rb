@@ -166,7 +166,8 @@ module GoodJob # :nodoc:
       pg_conn = ar_conn.raw_connection
       raise AdapterCannotListenError unless pg_conn.respond_to? :wait_for_notify
 
-      pg_conn.async_exec("SET application_name = #{pg_conn.escape_identifier(self.class.name)}").clear
+      application_name = "GoodJob: #{{ version: GoodJob::VERSION }.to_json}"
+      pg_conn.async_exec("SET application_name = #{pg_conn.escape_identifier(application_name)}").clear
       yield pg_conn
     ensure
       ar_conn&.disconnect!
